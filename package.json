@@ -1,6 +1,6 @@
 {
   "name": "claude-multi-proxy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Use Claude Code with multiple AI providers (Claude + Codex) via CLIProxyAPI. Switch models with /model.",
   "license": "MIT",
   "repository": {
