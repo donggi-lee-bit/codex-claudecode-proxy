@@ -4,46 +4,60 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import net from "node:net";
 import { spawnSync } from "node:child_process";
 
 const DEFAULT_PORT = 8317;
-const DEFAULT_MODEL = "gpt-5.3-codex";
+const CODEX_MODEL_ALIAS = "codex";
+const CODEX_MODEL_TARGET = "gpt-5.3-codex";
+const LABEL_PROXY = "com.claude-multi-proxy";
 
 function nowTs() {
   return Date.now().toString();
 }
 
 function log(msg) {
-  console.log(`[codex-claudecode-proxy] ${msg}`);
+  console.log(`[claude-multi-proxy] ${msg}`);
 }
 
 function warn(msg) {
-  console.error(`[codex-claudecode-proxy][WARN] ${msg}`);
+  console.error(`[claude-multi-proxy][WARN] ${msg}`);
 }
 
 function fail(msg, code = 1) {
-  console.error(`[codex-claudecode-proxy][FAIL] ${msg}`);
+  console.error(`[claude-multi-proxy][FAIL] ${msg}`);
   process.exit(code);
 }
 
 function usage(code = 0) {
   const txt = `Usage:
-  codex-claudecode-proxy [command]
+  claude-multi-proxy [command]
 
 Commands:
-  install      Install + configure + start (default)
-  start        Start proxy LaunchAgent
-  stop         Stop proxy + sync LaunchAgents
-  status       Show status
-  uninstall    Remove LaunchAgents + restore Claude Code settings (keeps proxy files)
-  purge        Uninstall + remove proxy files
-  help         Show this help
+  install          Install + configure + start (default)
+  claude-login     Login to Claude (Anthropic) via OAuth
+  codex-login      Login to Codex (OpenAI) via OAuth
+  start            Start proxy LaunchAgent
+  stop             Stop proxy LaunchAgent
+  status           Show status
+  uninstall        Remove LaunchAgent + restore Claude Code settings (keeps proxy files)
+  purge            Uninstall + remove proxy files
+  help             Show this help
 
 Examples:
-  npx -y codex-claudecode-proxy@latest
-  npx -y codex-claudecode-proxy@latest status
-  npx -y codex-claudecode-proxy@latest purge
+  npx -y claude-multi-proxy@latest
+  npx -y claude-multi-proxy@latest claude-login
+  npx -y claude-multi-proxy@latest codex-login
+  npx -y claude-multi-proxy@latest status
+  npx -y claude-multi-proxy@latest purge
+
+How it works:
+  1. Install CLIProxyAPI as a local proxy
+  2. Login to both Claude and Codex via OAuth
+  3. Use /model in Claude Code to switch between providers:
+     - /model opus    → Claude Opus (Anthropic)
+     - /model sonnet  → Claude Sonnet (Anthropic)
+     - /model haiku   → Claude Haiku (Anthropic)
+     - /model codex   → GPT-5.3 Codex (OpenAI)
 `;
   console.log(txt);
   process.exit(code);
@@ -51,9 +65,7 @@ Examples:
 
 function parseArgs(argv) {
   const args = [...argv];
-  const out = {
-    command: "install",
-  };
+  const out = { command: "install" };
 
   if (args.length > 0 && !args[0].startsWith("-")) {
     out.command = args.shift();
@@ -62,7 +74,6 @@ function parseArgs(argv) {
   while (args.length > 0) {
     const a = args.shift();
     if (a === "--help" || a === "-h" || a === "help") return { ...out, command: "help" };
-    // Backward compatibility: allow legacy "non-interactive" flags as no-ops.
     if (a === "--yes" || a === "-y") continue;
     fail(`unknown arg: ${a}`);
   }
@@ -109,16 +120,19 @@ function run(cmd, args, opts = {}) {
     allowFail = false,
     captureStdout = true,
     captureStderr = true,
+    inherit = false,
   } = opts;
 
   const r = spawnSync(cmd, args, {
     cwd,
     encoding: "utf8",
-    stdio: [
-      "ignore",
-      captureStdout ? "pipe" : "inherit",
-      captureStderr ? "pipe" : "inherit",
-    ],
+    stdio: inherit
+      ? "inherit"
+      : [
+          "ignore",
+          captureStdout ? "pipe" : "inherit",
+          captureStderr ? "pipe" : "inherit",
+        ],
   });
 
   if (!allowFail && (r.error || r.status !== 0)) {
@@ -135,7 +149,7 @@ function run(cmd, args, opts = {}) {
 
 async function fetchJson(url) {
   const res = await fetch(url, {
-    headers: { "user-agent": "codex-claudecode-proxy" },
+    headers: { "user-agent": "claude-multi-proxy" },
   });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} ${res.statusText} (${url})`);
@@ -146,7 +160,7 @@ async function fetchJson(url) {
 async function downloadToFile(url, destPath) {
   const res = await fetch(url, {
     redirect: "follow",
-    headers: { "user-agent": "codex-claudecode-proxy" },
+    headers: { "user-agent": "claude-multi-proxy" },
   });
   if (!res.ok) throw new Error(`download failed: HTTP ${res.status} ${res.statusText}`);
   ensureDir(path.dirname(destPath));
@@ -157,7 +171,6 @@ async function downloadToFile(url, destPath) {
 }
 
 function findFileRecursive(rootDir, names) {
-  /** @type {string[]} */
   const stack = [rootDir];
   while (stack.length > 0) {
     const dir = stack.pop();
@@ -193,60 +206,21 @@ function readPortFromProxyConfig(configFile) {
   }
 }
 
-async function isLocalPortFree(port) {
-  return await new Promise((resolve) => {
-    const srv = net.createServer();
-    // Don't keep the process alive just for this check.
-    srv.unref();
-    srv.once("error", () => resolve(false));
-    srv.listen({ port, host: "127.0.0.1" }, () => {
-      srv.close(() => resolve(true));
-    });
-  });
-}
-
-async function findAvailableLocalPort(preferredPort, scan = 20) {
-  const start = Number(preferredPort);
-  if (!Number.isInteger(start) || start <= 0 || start > 65535) return DEFAULT_PORT;
-
-  for (let i = 0; i <= scan; i += 1) {
-    const p = start + i;
-    if (p <= 0 || p > 65535) break;
-    // If our proxy is already responding, keep that port.
-    if (await proxyHealthcheck(p)) return p;
-    if (await isLocalPortFree(p)) return p;
-  }
-
-  // Fallback: ask the OS for an ephemeral free port.
-  return await new Promise((resolve) => {
-    const srv = net.createServer();
-    srv.unref();
-    srv.once("error", () => resolve(DEFAULT_PORT));
-    srv.listen({ port: 0, host: "127.0.0.1" }, () => {
-      const addr = srv.address();
-      const p = addr && typeof addr === "object" ? addr.port : DEFAULT_PORT;
-      srv.close(() => resolve(p));
-    });
-  });
-}
-
 async function resolveProxyPort({ configFile }) {
   const fromConfig = readPortFromProxyConfig(configFile);
-  if (fromConfig) {
-    // If the configured port is already healthy, keep it.
-    if (await proxyHealthcheck(fromConfig)) return fromConfig;
-    // If the port is free, keep it.
-    if (await isLocalPortFree(fromConfig)) return fromConfig;
-    warn(`configured port is busy (${fromConfig}); selecting a free port`);
-  }
-  return await findAvailableLocalPort(DEFAULT_PORT);
+  // Always use the configured port (or default). During install we stop
+  // existing proxy first, so the port should be free.
+  return fromConfig ?? DEFAULT_PORT;
 }
 
 async function proxyHealthcheck(port) {
   try {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 2000);
-    const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: ctrl.signal });
+    const res = await fetch(`http://127.0.0.1:${port}/v1/models`, {
+      headers: { Authorization: "Bearer sk-dummy" },
+      signal: ctrl.signal,
+    });
     clearTimeout(t);
     return res.ok;
   } catch {
@@ -254,32 +228,27 @@ async function proxyHealthcheck(port) {
   }
 }
 
-async function verifyReasoningEffort(port, model) {
-  for (let i = 0; i < 6; i += 1) {
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 20000);
-      const res = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model, input: "say pong" }),
-        signal: ctrl.signal,
-      });
-      clearTimeout(t);
-      const json = await res.json();
-      const effort = json?.reasoning?.effort;
-      if (effort === "xhigh") return true;
-      await sleep(1000);
-    } catch {
-      await sleep(1000);
-    }
-  }
-  return false;
-}
-
 function proxyConfigYaml({ port }) {
-  return `port: ${port}
-auth-dir: "~/.cli-proxy-api/auths"
+  return `# claude-multi-proxy config
+# Claude + Codex dual OAuth proxy
+
+host: "127.0.0.1"
+port: ${port}
+
+auth-dir: "~/.cli-proxy-api"
+
+api-keys:
+  - "sk-dummy"
+
+request-retry: 3
+
+# "codex" alias → ${CODEX_MODEL_TARGET}
+# Use /model codex in Claude Code to switch
+oauth-model-alias:
+  codex:
+    - name: "${CODEX_MODEL_TARGET}"
+      alias: "${CODEX_MODEL_ALIAS}"
+      fork: true
 
 payload:
   override:
@@ -287,74 +256,7 @@ payload:
         - name: "gpt-*"
           protocol: "codex"
       params:
-        "reasoning.effort": "xhigh"
-`;
-}
-
-function tokenSyncScript() {
-  return `#!/usr/bin/env bash
-set -euo pipefail
-
-SRC="\${1:-$HOME/.codex/auth.json}"
-DST="\${2:-$HOME/.cli-proxy-api/auths/codex-from-codex-cli.json}"
-
-if [[ ! -f "\${SRC}" ]]; then
-  echo "missing \${SRC} (Codex CLI login required)" >&2
-  exit 1
-fi
-
-access_token="$(plutil -extract tokens.access_token raw -o - "\${SRC}" 2>/dev/null || true)"
-if [[ -z "\${access_token}" ]]; then
-  echo "tokens.access_token missing in \${SRC}" >&2
-  exit 1
-fi
-
-id_token="$(plutil -extract tokens.id_token raw -o - "\${SRC}" 2>/dev/null || true)"
-refresh_token="$(plutil -extract tokens.refresh_token raw -o - "\${SRC}" 2>/dev/null || true)"
-account_id="$(plutil -extract tokens.account_id raw -o - "\${SRC}" 2>/dev/null || true)"
-last_refresh="$(plutil -extract last_refresh raw -o - "\${SRC}" 2>/dev/null || true)"
-
-mkdir -p "$(dirname "\${DST}")"
-
-cat > "\${DST}.tmp" <<JSON
-{
-  "access_token": "\${access_token}",
-  "account_id": "\${account_id}",
-  "disabled": false,
-  "email": "",
-  "expired": "",
-  "id_token": "\${id_token}",
-  "last_refresh": "\${last_refresh}",
-  "refresh_token": "\${refresh_token}",
-  "type": "codex"
-}
-JSON
-
-mv "\${DST}.tmp" "\${DST}"
-chmod 600 "\${DST}"
-`;
-}
-
-function buildPlistSync({ labelSync, syncScriptPath, homeDir, tokenSyncLog }) {
-  const authJsonPath = path.join(homeDir, ".codex", "auth.json");
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>${labelSync}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/bash</string>
-    <string>-lc</string>
-    <string>${syncScriptPath}</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>WatchPaths</key>
-  <array>
-    <string>${authJsonPath}</string>
-  </array>
-  <key>StandardOutPath</key><string>${tokenSyncLog}</string>
-  <key>StandardErrorPath</key><string>${tokenSyncLog}</string>
-</dict></plist>
+        "reasoning.effort": "high"
 `;
 }
 
@@ -366,7 +268,7 @@ function buildPlistProxy({ labelProxy, proxyBin, configFile, homeDir, proxyLog }
   <key>ProgramArguments</key>
   <array>
     <string>${proxyBin}</string>
-    <string>--config</string>
+    <string>-config</string>
     <string>${configFile}</string>
   </array>
   <key>RunAtLoad</key><true/>
@@ -397,7 +299,7 @@ async function installCliProxyApiBinary({ proxyBin }) {
     fail(`could not find asset containing: ${suffix}`);
   }
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-claudecode-proxy-"));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-multi-proxy-"));
   const tarball = path.join(tmpDir, "cli-proxy-api.tar.gz");
   await downloadToFile(asset.browser_download_url, tarball);
 
@@ -414,7 +316,7 @@ async function installCliProxyApiBinary({ proxyBin }) {
   log(`Installed: ${proxyBin}`);
 }
 
-function updateClaudeSettings({ claudeSettingsPath, port, model }) {
+function updateClaudeSettings({ claudeSettingsPath, port }) {
   ensureDir(path.dirname(claudeSettingsPath));
   if (!exists(claudeSettingsPath)) {
     writeFileAtomic(claudeSettingsPath, "{}\n", 0o600);
@@ -432,20 +334,19 @@ function updateClaudeSettings({ claudeSettingsPath, port, model }) {
   if (!json || typeof json !== "object") json = {};
   if (!json.env || typeof json.env !== "object") json.env = {};
 
-  json.model = model;
+  // Only set proxy routing — preserve original Claude model slots
   json.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${port}`;
-  // Placeholder token. Avoid secret-like prefixes (e.g., "sk-") to prevent false-positive secret scans.
-  json.env.ANTHROPIC_AUTH_TOKEN = "proxy-local";
-  json.env.ANTHROPIC_MODEL = model;
-  json.env.ANTHROPIC_SMALL_FAST_MODEL = model;
-  json.env.ANTHROPIC_DEFAULT_SONNET_MODEL = model;
-  json.env.ANTHROPIC_DEFAULT_OPUS_MODEL = model;
-  json.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = model;
+  json.env.ANTHROPIC_AUTH_TOKEN = "sk-dummy";
+
+  // Keep original Claude models for each slot
+  json.env.ANTHROPIC_DEFAULT_OPUS_MODEL = "claude-opus-4-6";
+  json.env.ANTHROPIC_DEFAULT_SONNET_MODEL = "claude-sonnet-4-5-20250929";
+  json.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = "claude-haiku-4-5-20251001";
 
   writeFileAtomic(claudeSettingsPath, `${JSON.stringify(json, null, 2)}\n`, 0o600);
 }
 
-function cleanupClaudeSettings({ claudeSettingsPath, model }) {
+function cleanupClaudeSettings({ claudeSettingsPath }) {
   if (!exists(claudeSettingsPath)) return;
 
   backupFile(claudeSettingsPath);
@@ -459,13 +360,14 @@ function cleanupClaudeSettings({ claudeSettingsPath, model }) {
 
   if (!json || typeof json !== "object") return;
 
-  if (json.model === model) delete json.model;
+  // Remove model if it was set to codex
+  if (json.model === CODEX_MODEL_ALIAS || json.model === CODEX_MODEL_TARGET) {
+    delete json.model;
+  }
 
   if (json.env && typeof json.env === "object") {
     delete json.env.ANTHROPIC_BASE_URL;
     delete json.env.ANTHROPIC_AUTH_TOKEN;
-    delete json.env.ANTHROPIC_MODEL;
-    delete json.env.ANTHROPIC_SMALL_FAST_MODEL;
     delete json.env.ANTHROPIC_DEFAULT_SONNET_MODEL;
     delete json.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
     delete json.env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
@@ -475,7 +377,6 @@ function cleanupClaudeSettings({ claudeSettingsPath, model }) {
 }
 
 function getUsername() {
-  // Prefer $USER for consistency with LaunchAgent labels.
   if (process.env.USER && process.env.USER.trim()) return process.env.USER.trim();
   return os.userInfo().username;
 }
@@ -511,100 +412,148 @@ async function waitForHealthy(port, msTotal = 8000) {
   return false;
 }
 
-async function installFlow(opts) {
+function getProxyBin(homeDir) {
+  return path.join(homeDir, ".cli-proxy-api", "cli-proxy-api");
+}
+
+function hasAuthFiles(proxyDir) {
+  const files = fs.readdirSync(proxyDir).filter((f) => f.endsWith(".json"));
+  const hasClaude = files.some((f) => f.startsWith("claude-"));
+  const hasCodex = files.some((f) => f.startsWith("codex-"));
+  return { hasClaude, hasCodex, files };
+}
+
+async function stopExistingProxy(uid) {
+  // Stop our own LaunchAgent
+  launchctlBootout(uid, LABEL_PROXY);
+
+  // Also clean up known legacy labels from upstream codex-claudecode-proxy
+  const username = getUsername();
+  for (const legacy of [
+    `com.${username}.cli-proxy-api`,
+    `com.${username}.cli-proxy-api-token-sync`,
+    "com.cliproxyapi",
+  ]) {
+    launchctlBootout(uid, legacy);
+  }
+
+  // Wait for port to free up
+  await sleep(1000);
+}
+
+async function installFlow() {
   if (process.platform !== "darwin") {
     fail("macOS only (LaunchAgents-based install).");
   }
 
   const homeDir = os.homedir();
-  const username = getUsername();
   const uid = getUid();
 
   const proxyDir = path.join(homeDir, ".cli-proxy-api");
-  const authDir = path.join(proxyDir, "auths");
   const configFile = path.join(proxyDir, "config.yaml");
-  const syncScriptPath = path.join(proxyDir, "sync-codex-token.sh");
-  const proxyBin = path.join(homeDir, ".local", "bin", "cli-proxy-api");
-  const proxyLog = path.join(proxyDir, "cli-proxy-api.log");
-  const tokenSyncLog = path.join(proxyDir, "token-sync.log");
+  const proxyBin = getProxyBin(homeDir);
+  const proxyLog = path.join(proxyDir, "proxy.log");
   const claudeSettingsPath = path.join(homeDir, ".claude", "settings.json");
-
-  const port = await resolveProxyPort({ configFile });
-  const model = DEFAULT_MODEL;
-
-  const labelProxy = `com.${username}.cli-proxy-api`;
-  const labelSync = `com.${username}.cli-proxy-api-token-sync`;
-  const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${labelProxy}.plist`);
-  const plistSync = path.join(homeDir, "Library", "LaunchAgents", `${labelSync}.plist`);
-
-  const codexAuth = path.join(homeDir, ".codex", "auth.json");
-  if (!exists(codexAuth)) {
-    fail(`missing ${codexAuth} (Codex CLI login required)`);
-  }
+  const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${LABEL_PROXY}.plist`);
 
   ensureDir(proxyDir);
-  ensureDir(authDir);
-  ensureDir(path.dirname(proxyBin));
   ensureDir(path.dirname(plistProxy));
 
+  // 1. Stop existing proxy first (prevents port conflict)
+  log("Stopping existing proxy...");
+  await stopExistingProxy(uid);
+
+  // 2. Install CLIProxyAPI binary
   await installCliProxyApiBinary({ proxyBin });
 
-  log("Writing config + token sync script...");
+  // 3. Resolve port and write config
+  const port = await resolveProxyPort({ configFile });
+  log("Writing proxy config...");
   writeFileAtomic(configFile, proxyConfigYaml({ port }), 0o644);
-  writeFileAtomic(syncScriptPath, tokenSyncScript(), 0o755);
 
-  log("Syncing token once...");
-  run("/bin/bash", ["-lc", syncScriptPath]);
+  // 4. Check OAuth status
+  const auth = hasAuthFiles(proxyDir);
+  if (!auth.hasClaude) {
+    log("");
+    log("Claude OAuth not found. Running claude-login...");
+    run(proxyBin, ["-config", configFile, "-claude-login"], { inherit: true, allowFail: true });
+  }
+  if (!auth.hasCodex) {
+    log("");
+    log("Codex OAuth not found. Running codex-login...");
+    run(proxyBin, ["-config", configFile, "-codex-login"], { inherit: true, allowFail: true });
+  }
 
-  log("Writing LaunchAgents...");
-  writeFileAtomic(plistSync, buildPlistSync({ labelSync, syncScriptPath, homeDir, tokenSyncLog }), 0o644);
-  writeFileAtomic(plistProxy, buildPlistProxy({ labelProxy, proxyBin, configFile, homeDir, proxyLog }), 0o644);
+  // Re-check auth after login attempts
+  const authAfter = hasAuthFiles(proxyDir);
+  if (!authAfter.hasClaude && !authAfter.hasCodex) {
+    fail("No OAuth credentials found. Run 'claude-login' or 'codex-login' first.");
+  }
 
-  log("Reloading LaunchAgents...");
-  launchctlBootout(uid, labelProxy);
-  launchctlBootout(uid, labelSync);
-  launchctlBootstrap(uid, plistSync);
+  // 5. Write and load LaunchAgent
+  log("Writing LaunchAgent...");
+  writeFileAtomic(plistProxy, buildPlistProxy({ labelProxy: LABEL_PROXY, proxyBin, configFile, homeDir, proxyLog }), 0o644);
+
+  log("Starting proxy...");
   launchctlBootstrap(uid, plistProxy);
-  launchctlKickstart(uid, labelSync);
-  launchctlKickstart(uid, labelProxy);
+  launchctlKickstart(uid, LABEL_PROXY);
 
   const healthy = await waitForHealthy(port, 10000);
   if (!healthy) fail(`proxy did not become healthy (check ${proxyLog})`);
 
+  // 6. Update Claude Code settings
   log("Updating Claude Code settings...");
-  updateClaudeSettings({ claudeSettingsPath, port, model });
-
-  log("Verifying reasoning.effort=xhigh ...");
-  const ok = await verifyReasoningEffort(port, model);
-  if (!ok) fail("expected reasoning.effort=xhigh but verification failed");
+  updateClaudeSettings({ claudeSettingsPath, port });
 
   log("");
-  log("All done.");
-  log(`- Proxy: http://127.0.0.1:${port}`);
-  log(`- Config: ${configFile}`);
-  log(`- Claude settings: ${claudeSettingsPath}`);
-  log("- Next: run 'claude'");
+  log("All done!");
+  log(`  Proxy: http://127.0.0.1:${port}`);
+  log(`  Config: ${configFile}`);
+  log(`  Log: ${proxyLog}`);
+  log("");
+  log("Available models in Claude Code (/model):");
+  log("  opus    → Claude Opus (Anthropic)");
+  log("  sonnet  → Claude Sonnet (Anthropic)");
+  log("  haiku   → Claude Haiku (Anthropic)");
+  log("  codex   → GPT-5.3 Codex (OpenAI)");
+  log("");
+  if (!authAfter.hasClaude) {
+    warn("Claude OAuth missing — run: npx claude-multi-proxy claude-login");
+  }
+  if (!authAfter.hasCodex) {
+    warn("Codex OAuth missing — run: npx claude-multi-proxy codex-login");
+  }
+  log("Restart Claude Code to apply changes.");
 }
 
-async function startFlow(opts) {
+async function oauthLoginFlow(provider) {
   if (process.platform !== "darwin") fail("macOS only.");
   const homeDir = os.homedir();
-  const username = getUsername();
+  const proxyDir = path.join(homeDir, ".cli-proxy-api");
+  const configFile = path.join(proxyDir, "config.yaml");
+  const proxyBin = getProxyBin(homeDir);
+
+  if (!exists(proxyBin)) {
+    fail(`CLIProxyAPI not installed. Run 'install' first.`);
+  }
+
+  const flag = provider === "claude" ? "-claude-login" : "-codex-login";
+  log(`Starting ${provider} OAuth login...`);
+  run(proxyBin, ["-config", configFile, flag], { inherit: true });
+  log(`${provider} login completed.`);
+}
+
+async function startFlow() {
+  if (process.platform !== "darwin") fail("macOS only.");
+  const homeDir = os.homedir();
   const uid = getUid();
   const configFile = path.join(homeDir, ".cli-proxy-api", "config.yaml");
   const port = readPortFromProxyConfig(configFile) ?? DEFAULT_PORT;
-  const labelProxy = `com.${username}.cli-proxy-api`;
-  const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${labelProxy}.plist`);
-  const labelSync = `com.${username}.cli-proxy-api-token-sync`;
-  const plistSync = path.join(homeDir, "Library", "LaunchAgents", `${labelSync}.plist`);
+  const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${LABEL_PROXY}.plist`);
 
-  if (exists(plistSync)) {
-    launchctlBootstrap(uid, plistSync);
-    launchctlKickstart(uid, labelSync);
-  }
   if (!exists(plistProxy)) fail(`missing plist: ${plistProxy} (run install first)`);
   launchctlBootstrap(uid, plistProxy);
-  launchctlKickstart(uid, labelProxy);
+  launchctlKickstart(uid, LABEL_PROXY);
 
   const healthy = await waitForHealthy(port, 10000);
   if (!healthy) fail("proxy did not become healthy");
@@ -613,28 +562,48 @@ async function startFlow(opts) {
 
 async function stopFlow() {
   if (process.platform !== "darwin") fail("macOS only.");
-  const username = getUsername();
   const uid = getUid();
-  const labelProxy = `com.${username}.cli-proxy-api`;
-  const labelSync = `com.${username}.cli-proxy-api-token-sync`;
-  launchctlBootout(uid, labelProxy);
-  launchctlBootout(uid, labelSync);
-  log("proxy stopped (launchagents unloaded)");
+  launchctlBootout(uid, LABEL_PROXY);
+  log("proxy stopped");
 }
 
-async function statusFlow(opts) {
+async function statusFlow() {
   const homeDir = os.homedir();
-  const configFile = path.join(homeDir, ".cli-proxy-api", "config.yaml");
+  const proxyDir = path.join(homeDir, ".cli-proxy-api");
+  const configFile = path.join(proxyDir, "config.yaml");
   const port = readPortFromProxyConfig(configFile) ?? DEFAULT_PORT;
   const portOk = await proxyHealthcheck(port);
-  log(`healthcheck: ${portOk ? "OK" : "NOT RUNNING"} (http://127.0.0.1:${port}/v1/models)`);
+
+  log(`Proxy: ${portOk ? "RUNNING" : "NOT RUNNING"} (http://127.0.0.1:${port})`);
+
   if (process.platform === "darwin") {
-    const username = getUsername();
     const uid = getUid();
-    const labelProxy = `com.${username}.cli-proxy-api`;
-    const labelSync = `com.${username}.cli-proxy-api-token-sync`;
-    log(`launchctl proxy job: ${launchctlPrint(uid, labelProxy) ? "loaded" : "not loaded"}`);
-    log(`launchctl token-sync job: ${launchctlPrint(uid, labelSync) ? "loaded" : "not loaded"}`);
+    log(`LaunchAgent: ${launchctlPrint(uid, LABEL_PROXY) ? "loaded" : "not loaded"}`);
+  }
+
+  if (exists(proxyDir)) {
+    const auth = hasAuthFiles(proxyDir);
+    log(`Claude OAuth: ${auth.hasClaude ? "configured" : "not configured"}`);
+    log(`Codex OAuth: ${auth.hasCodex ? "configured" : "not configured"}`);
+  }
+
+  if (portOk) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 3000);
+      const res = await fetch(`http://127.0.0.1:${port}/v1/models`, {
+        headers: { Authorization: "Bearer sk-dummy" },
+        signal: ctrl.signal,
+      });
+      clearTimeout(t);
+      if (res.ok) {
+        const data = await res.json();
+        const models = (data.data || []).map((m) => m.id).sort();
+        log(`Models (${models.length}): ${models.join(", ")}`);
+      }
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -643,27 +612,29 @@ async function uninstallFlow(opts) {
   const homeDir = os.homedir();
   const username = getUsername();
   const uid = getUid();
-  const labelProxy = `com.${username}.cli-proxy-api`;
-  const labelSync = `com.${username}.cli-proxy-api-token-sync`;
-  const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${labelProxy}.plist`);
-  const plistSync = path.join(homeDir, "Library", "LaunchAgents", `${labelSync}.plist`);
+  const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${LABEL_PROXY}.plist`);
   const claudeSettingsPath = path.join(homeDir, ".claude", "settings.json");
   const proxyDir = path.join(homeDir, ".cli-proxy-api");
-  const proxyBin = path.join(homeDir, ".local", "bin", "cli-proxy-api");
 
-  launchctlBootout(uid, labelProxy);
-  launchctlBootout(uid, labelSync);
+  // Stop our proxy and clean up legacy labels
+  await stopExistingProxy(uid);
 
-  if (exists(plistProxy)) fs.rmSync(plistProxy, { force: true });
-  if (exists(plistSync)) fs.rmSync(plistSync, { force: true });
+  // Remove legacy plist files
+  const legacyPlists = [
+    `com.${username}.cli-proxy-api`,
+    `com.${username}.cli-proxy-api-token-sync`,
+    "com.cliproxyapi",
+  ].map((l) => path.join(homeDir, "Library", "LaunchAgents", `${l}.plist`));
 
-  // Always restore Claude Code settings so "claude" doesn't keep pointing at a removed proxy.
-  cleanupClaudeSettings({ claudeSettingsPath, model: DEFAULT_MODEL });
+  for (const p of [...legacyPlists, plistProxy]) {
+    if (exists(p)) fs.rmSync(p, { force: true });
+  }
+
+  // Restore Claude Code settings
+  cleanupClaudeSettings({ claudeSettingsPath });
 
   if (opts.command === "purge") {
-    // Remove proxy installation files (best-effort).
     if (exists(proxyDir)) fs.rmSync(proxyDir, { recursive: true, force: true });
-    if (exists(proxyBin)) fs.rmSync(proxyBin, { force: true });
     log("purge completed (proxy files removed)");
     return;
   }
@@ -678,16 +649,22 @@ async function main() {
   try {
     switch (opts.command) {
       case "install":
-        await installFlow(opts);
+        await installFlow();
+        break;
+      case "claude-login":
+        await oauthLoginFlow("claude");
+        break;
+      case "codex-login":
+        await oauthLoginFlow("codex");
         break;
       case "start":
-        await startFlow(opts);
+        await startFlow();
         break;
       case "stop":
         await stopFlow();
         break;
       case "status":
-        await statusFlow(opts);
+        await statusFlow();
         break;
       case "uninstall":
         await uninstallFlow(opts);

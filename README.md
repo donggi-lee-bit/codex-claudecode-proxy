@@ -1,47 +1,92 @@
-# codex-claudecode-proxy
-[![DeepWiki](https://img.shields.io/badge/DeepWiki-pinion05%2Fcodex--claudecode--proxy-blue.svg?logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACwAAAAyCAYAAAAnWDnqAAAAAXNSR0IArs4c6QAAA05JREFUaEPtmUtyEzEQhtWTQyQLHNak2AB7ZnyXZMEjXMGeK/AIi+QuHrMnbChYY7MIh8g01fJoopFb0uhhEqqcbWTp06/uv1saEDv4O3n3dV60RfP947Mm9/SQc0ICFQgzfc4CYZoTPAswgSJCCUJUnAAoRHOAUOcATwbmVLWdGoH//PB8mnKqScAhsD0kYP3j/Yt5LPQe2KvcXmGvRHcDnpxfL2zOYJ1mFwrryWTz0advv1Ut4CJgf5uhDuDj5eUcAUoahrdY/56ebRWeraTjMt/00Sh3UDtjgHtQNHwcRGOC98BJEAEymycmYcWwOprTgcB6VZ5JK5TAJ+fXGLBm3FDAmn6oPPjR4rKCAoJCal2eAiQp2x0vxTPB3ALO2CRkwmDy5WohzBDwSEFKRwPbknEggCPB/imwrycgxX2NzoMCHhPkDwqYMr9tRcP5qNrMZHkVnOjRMWwLCcr8ohBVb1OMjxLwGCvjTikrsBOiA6fNyCrm8V1rP93iVPpwaE+gO0SsWmPiXB+jikdf6SizrT5qKasx5j8ABbHpFTx+vFXp9EnYQmLx02h1QTTrl6eDqxLnGjporxl3NL3agEvXdT0WmEost648sQOYAeJS9Q7bfUVoMGnjo4AZdUMQku50McDcMWcBPvr0SzbTAFDfvJqwLzgxwATnCgnp4wDl6Aa+Ax283gghmj+vj7feE2KBBRMW3FzOpLOADl0Isb5587h/U4gGvkt5v60Z1VLG8BhYjbzRwyQZemwAd6cCR5/XFWLYZRIMpX39AR0tjaGGiGzLVyhse5C9RKC6ai42ppWPKiBagOvaYk8lO7DajerabOZP46Lby5wKjw1HCRx7p9sVMOWGzb/vA1hwiWc6jm3MvQDTogQkiqIhJV0nBQBTU+3okKCFDy9WwferkHjtxib7t3xIUQtHxnIwtx4mpg26/HfwVNVDb4oI9RHmx5WGelRVlrtiw43zboCLaxv46AZeB3IlTkwouebTr1y2NjSpHz68WNFjHvupy3q8TFn3Hos2IAk4Ju5dCo8B3wP7VPr/FGaKiG+T+v+TQqIrOqMTL1VdWV1DdmcbO8KXBz6esmYWYKPwDL5b5FA1a0hwapHiom0r/cKaoqr+27/XcrS5UwSMbQAAAABJRU5ErkJggg==)](https://deepwiki.com/pinion05/codex-claudecode-proxy)
+# claude-multi-proxy
 
-[![NPM](https://nodei.co/npm/codex-claudecode-proxy.svg)](https://nodei.co/npm/codex-claudecode-proxy/)
+[![NPM](https://nodei.co/npm/claude-multi-proxy.svg)](https://nodei.co/npm/claude-multi-proxy/)
 
+Use Claude Code with multiple AI providers. Switch between Claude (Anthropic) and Codex (OpenAI) models using `/model`.
 
-A local proxy installer CLI that translates the OpenAI OAuth API into a Claude-compatible API.
+> Forked from [pinion05/codex-claudecode-proxy](https://github.com/pinion05/codex-claudecode-proxy)
 
-## One-Liner
+## How it works
 
-```bash
-npx -y codex-claudecode-proxy
+```
+Claude Code ──→ Local Proxy (CLIProxyAPI) ──→ Anthropic API (Claude OAuth)
+                      ↓
+                      └──→ Codex API (OpenAI OAuth)
 ```
 
-## Requirements
+Both providers use **OAuth authentication** — no API keys needed. Just log in with your existing subscriptions.
 
-- macOS only (for now)
-- Claude Code is installed
-- You are logged in to Codex CLI
+## Quick Start
+
+```bash
+npx -y claude-multi-proxy
+```
+
+This will:
+1. Download and install CLIProxyAPI
+2. Prompt OAuth login for Claude and Codex
+3. Configure Claude Code to route through the proxy
+4. Set up a LaunchAgent for auto-start
+
+## Model Switching
+
+After installation, use `/model` in Claude Code:
+
+| Command | Model | Provider |
+|---------|-------|----------|
+| `/model opus` | Claude Opus | Anthropic |
+| `/model sonnet` | Claude Sonnet | Anthropic |
+| `/model haiku` | Claude Haiku | Anthropic |
+| **`/model codex`** | **GPT-5.3 Codex** | **OpenAI** |
 
 ## Commands
 
 ```bash
 # Install (safe to re-run)
-npx -y codex-claudecode-proxy
+npx -y claude-multi-proxy
+
+# OAuth login (individual)
+npx -y claude-multi-proxy claude-login
+npx -y claude-multi-proxy codex-login
 
 # Status
-npx -y codex-claudecode-proxy status
+npx -y claude-multi-proxy status
 
-# Start/stop manually
-npx -y codex-claudecode-proxy start
-npx -y codex-claudecode-proxy stop
+# Start/stop
+npx -y claude-multi-proxy start
+npx -y claude-multi-proxy stop
 
-# Uninstall: stop background services and restore Claude Code settings
-npx -y codex-claudecode-proxy uninstall
+# Uninstall: stop proxy and restore Claude Code settings
+npx -y claude-multi-proxy uninstall
 
-# Purge: uninstall + remove installed files
-npx -y codex-claudecode-proxy purge
+# Purge: uninstall + remove all proxy files
+npx -y claude-multi-proxy purge
 ```
 
-## Integrity / Safety
+## Requirements
 
-- Claude Code settings are configured automatically, and a backup is created before changes.
-- Running `uninstall` removes the proxy-related Claude settings and restores the original behavior.
+- macOS (LaunchAgent-based)
+- Node.js >= 18
+- Claude Code installed
+- Anthropic account (Claude subscription)
+- OpenAI account (for Codex)
+
+## Differences from upstream
+
+| Feature | [codex-claudecode-proxy](https://github.com/pinion05/codex-claudecode-proxy) | claude-multi-proxy |
+|---------|----------------------------------------------|-------------------|
+| Target user | No Claude subscription | Both subscriptions |
+| Providers | Codex only | Claude + Codex |
+| Model slots | All overridden to Codex | Original Claude models preserved |
+| Codex access | Replaces Sonnet/Opus/Haiku | Separate `/model codex` |
+| Auth method | Codex CLI token sync | CLIProxyAPI native OAuth |
+| LaunchAgents | 2 (proxy + token sync) | 1 (proxy only) |
+
+## Safety
+
+- Claude Code settings are backed up before any changes
+- `uninstall` restores original Claude Code settings
+- Proxy binds to `127.0.0.1` only (localhost)
 
 ## License
 
