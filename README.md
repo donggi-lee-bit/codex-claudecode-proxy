@@ -16,10 +16,15 @@ Claude Code ──→ Local Proxy (CLIProxyAPI) ──→ Anthropic API (Claude 
 
 Both providers use **OAuth authentication** — no API keys needed. Just log in with your existing subscriptions.
 
-## Quick Start
+## Installation
 
 ```bash
+# npx (no install needed)
 npx -y claude-multi-proxy
+
+# or install globally
+npm install -g claude-multi-proxy
+claude-multi-proxy
 ```
 
 This will:
