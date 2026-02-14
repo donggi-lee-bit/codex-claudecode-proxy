@@ -87,6 +87,27 @@ npx -y claude-multi-proxy purge
 | Auth method | Codex CLI token sync | CLIProxyAPI native OAuth |
 | LaunchAgents | 2 (proxy + token sync) | 1 (proxy only) |
 
+## Known Issues
+
+### Thinking block signature error when switching models
+
+When switching from Codex to Claude (e.g., `/model codex` → `/model opus`) **within the same session**, you may encounter a 400 error:
+
+```
+Invalid `signature` in `thinking` block
+```
+
+**Cause:** CLIProxyAPI wraps Codex responses in Claude-format thinking blocks, but cannot generate cryptographically valid signatures (only Anthropic's servers can). When conversation history containing these blocks is sent to Claude's API, signature validation fails.
+
+**Workaround:** Use `/clear` before switching models to reset the conversation history.
+
+```
+/clear
+/model opus
+```
+
+See [CLIProxyAPI #1584](https://github.com/router-for-me/CLIProxyAPI/issues/1584) for upstream tracking.
+
 ## Safety
 
 - Claude Code settings are backed up before any changes
