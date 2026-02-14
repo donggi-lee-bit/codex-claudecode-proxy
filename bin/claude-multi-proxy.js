@@ -45,10 +45,18 @@ Commands:
 
 Examples:
   npx -y claude-multi-proxy@latest
+  npx -y claude-multi-proxy@latest --profile work
+  npx -y claude-multi-proxy@latest --claude-settings-path ~/custom/claude-settings.json
+  npx -y claude-multi-proxy@latest --no-global-settings
   npx -y claude-multi-proxy@latest claude-login
   npx -y claude-multi-proxy@latest codex-login
   npx -y claude-multi-proxy@latest status
   npx -y claude-multi-proxy@latest purge
+
+Options:
+  --profile <name>              Isolate proxy state by profile (default: default)
+  --claude-settings-path <path> Override Claude settings file path
+  --no-global-settings          Skip Claude settings update during install/uninstall
 
 How it works:
   1. Install CLIProxyAPI as a local proxy
@@ -65,7 +73,7 @@ How it works:
 
 function parseArgs(argv) {
   const args = [...argv];
-  const out = { command: "install" };
+  const out = { command: "install", profile: "default", noGlobalSettings: false };
 
   if (args.length > 0 && !args[0].startsWith("-")) {
     out.command = args.shift();
@@ -75,6 +83,20 @@ function parseArgs(argv) {
     const a = args.shift();
     if (a === "--help" || a === "-h" || a === "help") return { ...out, command: "help" };
     if (a === "--yes" || a === "-y") continue;
+    if (a === "--profile") {
+      if (args.length === 0) fail("--profile requires a value");
+      out.profile = args.shift();
+      continue;
+    }
+    if (a === "--claude-settings-path") {
+      if (args.length === 0) fail("--claude-settings-path requires a value");
+      out.claudeSettingsPath = args.shift();
+      continue;
+    }
+    if (a === "--no-global-settings") {
+      out.noGlobalSettings = true;
+      continue;
+    }
     fail(`unknown arg: ${a}`);
   }
 
@@ -228,14 +250,26 @@ async function proxyHealthcheck(port) {
   }
 }
 
-function proxyConfigYaml({ port }) {
+function profileDirName(profile) {
+  return profile === "default" ? ".cli-proxy-api" : `.cli-proxy-api-${profile}`;
+}
+
+function validateProfile(profileRaw) {
+  const profile = profileRaw && profileRaw.trim() ? profileRaw.trim() : "default";
+  if (!/^[a-zA-Z0-9._-]+$/.test(profile) || profile === "." || profile === "..") {
+    fail(`invalid profile: ${profileRaw}`);
+  }
+  return profile;
+}
+
+function proxyConfigYaml({ port, authDirName }) {
   return `# claude-multi-proxy config
 # Claude + Codex dual OAuth proxy
 
 host: "127.0.0.1"
 port: ${port}
 
-auth-dir: "~/.cli-proxy-api"
+auth-dir: "~/${authDirName}"
 
 api-keys:
   - "sk-dummy"
@@ -346,6 +380,32 @@ function updateClaudeSettings({ claudeSettingsPath, port }) {
   writeFileAtomic(claudeSettingsPath, `${JSON.stringify(json, null, 2)}\n`, 0o600);
 }
 
+function resolvePaths({ homeDir, profile, claudeSettingsPath }) {
+  const normalizedProfile = validateProfile(profile);
+  const authDirName = profileDirName(normalizedProfile);
+
+  const proxyDir = path.join(homeDir, authDirName);
+  const configFile = path.join(proxyDir, "config.yaml");
+  const proxyLog = path.join(proxyDir, "proxy.log");
+  const proxyBin = getProxyBin(proxyDir);
+  const labelProxy = normalizedProfile === "default" ? LABEL_PROXY : `${LABEL_PROXY}.${normalizedProfile}`;
+  const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${labelProxy}.plist`);
+  const resolvedClaudeSettingsPath = claudeSettingsPath
+    || path.join(homeDir, ".claude", normalizedProfile === "default" ? "settings.json" : `settings.${normalizedProfile}.json`);
+
+  return {
+    profile: normalizedProfile,
+    authDirName,
+    proxyDir,
+    configFile,
+    proxyBin,
+    proxyLog,
+    labelProxy,
+    plistProxy,
+    claudeSettingsPath: resolvedClaudeSettingsPath,
+  };
+}
+
 function cleanupClaudeSettings({ claudeSettingsPath }) {
   if (!exists(claudeSettingsPath)) return;
 
@@ -412,20 +472,21 @@ async function waitForHealthy(port, msTotal = 8000) {
   return false;
 }
 
-function getProxyBin(homeDir) {
-  return path.join(homeDir, ".cli-proxy-api", "cli-proxy-api");
+function getProxyBin(proxyDir) {
+  return path.join(proxyDir, "cli-proxy-api");
 }
 
 function hasAuthFiles(proxyDir) {
+  if (!exists(proxyDir)) return { hasClaude: false, hasCodex: false, files: [] };
   const files = fs.readdirSync(proxyDir).filter((f) => f.endsWith(".json"));
   const hasClaude = files.some((f) => f.startsWith("claude-"));
   const hasCodex = files.some((f) => f.startsWith("codex-"));
   return { hasClaude, hasCodex, files };
 }
 
-async function stopExistingProxy(uid) {
+async function stopExistingProxy(uid, labelProxy = LABEL_PROXY) {
   // Stop our own LaunchAgent
-  launchctlBootout(uid, LABEL_PROXY);
+  launchctlBootout(uid, labelProxy);
 
   // Also clean up known legacy labels from upstream codex-claudecode-proxy
   const username = getUsername();
@@ -441,75 +502,83 @@ async function stopExistingProxy(uid) {
   await sleep(1000);
 }
 
-async function installFlow() {
+async function installFlow(opts = {}) {
   if (process.platform !== "darwin") {
     fail("macOS only (LaunchAgents-based install).");
   }
 
   const homeDir = os.homedir();
   const uid = getUid();
+  const paths = resolvePaths({ homeDir, profile: opts.profile, claudeSettingsPath: opts.claudeSettingsPath });
 
-  const proxyDir = path.join(homeDir, ".cli-proxy-api");
-  const configFile = path.join(proxyDir, "config.yaml");
-  const proxyBin = getProxyBin(homeDir);
-  const proxyLog = path.join(proxyDir, "proxy.log");
-  const claudeSettingsPath = path.join(homeDir, ".claude", "settings.json");
-  const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${LABEL_PROXY}.plist`);
-
-  ensureDir(proxyDir);
-  ensureDir(path.dirname(plistProxy));
+  ensureDir(paths.proxyDir);
+  ensureDir(path.dirname(paths.plistProxy));
 
   // 1. Stop existing proxy first (prevents port conflict)
-  log("Stopping existing proxy...");
-  await stopExistingProxy(uid);
+  log(`Stopping existing proxy (profile: ${paths.profile})...`);
+  await stopExistingProxy(uid, paths.labelProxy);
 
   // 2. Install CLIProxyAPI binary
-  await installCliProxyApiBinary({ proxyBin });
+  await installCliProxyApiBinary({ proxyBin: paths.proxyBin });
 
   // 3. Resolve port and write config
-  const port = await resolveProxyPort({ configFile });
+  const port = await resolveProxyPort({ configFile: paths.configFile });
   log("Writing proxy config...");
-  writeFileAtomic(configFile, proxyConfigYaml({ port }), 0o644);
+  writeFileAtomic(paths.configFile, proxyConfigYaml({ port, authDirName: paths.authDirName }), 0o644);
 
   // 4. Check OAuth status
-  const auth = hasAuthFiles(proxyDir);
+  const auth = hasAuthFiles(paths.proxyDir);
   if (!auth.hasClaude) {
     log("");
     log("Claude OAuth not found. Running claude-login...");
-    run(proxyBin, ["-config", configFile, "-claude-login"], { inherit: true, allowFail: true });
+    run(paths.proxyBin, ["-config", paths.configFile, "-claude-login"], { inherit: true, allowFail: true });
   }
   if (!auth.hasCodex) {
     log("");
     log("Codex OAuth not found. Running codex-login...");
-    run(proxyBin, ["-config", configFile, "-codex-login"], { inherit: true, allowFail: true });
+    run(paths.proxyBin, ["-config", paths.configFile, "-codex-login"], { inherit: true, allowFail: true });
   }
 
   // Re-check auth after login attempts
-  const authAfter = hasAuthFiles(proxyDir);
+  const authAfter = hasAuthFiles(paths.proxyDir);
   if (!authAfter.hasClaude && !authAfter.hasCodex) {
     fail("No OAuth credentials found. Run 'claude-login' or 'codex-login' first.");
   }
 
   // 5. Write and load LaunchAgent
   log("Writing LaunchAgent...");
-  writeFileAtomic(plistProxy, buildPlistProxy({ labelProxy: LABEL_PROXY, proxyBin, configFile, homeDir, proxyLog }), 0o644);
+  writeFileAtomic(paths.plistProxy, buildPlistProxy({
+    labelProxy: paths.labelProxy,
+    proxyBin: paths.proxyBin,
+    configFile: paths.configFile,
+    homeDir,
+    proxyLog: paths.proxyLog,
+  }), 0o644);
 
   log("Starting proxy...");
-  launchctlBootstrap(uid, plistProxy);
-  launchctlKickstart(uid, LABEL_PROXY);
+  launchctlBootstrap(uid, paths.plistProxy);
+  launchctlKickstart(uid, paths.labelProxy);
 
   const healthy = await waitForHealthy(port, 10000);
-  if (!healthy) fail(`proxy did not become healthy (check ${proxyLog})`);
+  if (!healthy) fail(`proxy did not become healthy (check ${paths.proxyLog})`);
 
   // 6. Update Claude Code settings
-  log("Updating Claude Code settings...");
-  updateClaudeSettings({ claudeSettingsPath, port });
+  if (opts.noGlobalSettings) {
+    log("Skipping Claude Code settings update (--no-global-settings).");
+  } else {
+    log("Updating Claude Code settings...");
+    updateClaudeSettings({ claudeSettingsPath: paths.claudeSettingsPath, port });
+  }
 
   log("");
   log("All done!");
+  log(`  Profile: ${paths.profile}`);
   log(`  Proxy: http://127.0.0.1:${port}`);
-  log(`  Config: ${configFile}`);
-  log(`  Log: ${proxyLog}`);
+  log(`  Config: ${paths.configFile}`);
+  log(`  Log: ${paths.proxyLog}`);
+  if (!opts.noGlobalSettings) {
+    log(`  Claude settings: ${paths.claudeSettingsPath}`);
+  }
   log("");
   log("Available models in Claude Code (/model):");
   log("  opus    → Claude Opus (Anthropic)");
@@ -526,66 +595,63 @@ async function installFlow() {
   log("Restart Claude Code to apply changes.");
 }
 
-async function oauthLoginFlow(provider) {
+async function oauthLoginFlow(provider, opts = {}) {
   if (process.platform !== "darwin") fail("macOS only.");
   const homeDir = os.homedir();
-  const proxyDir = path.join(homeDir, ".cli-proxy-api");
-  const configFile = path.join(proxyDir, "config.yaml");
-  const proxyBin = getProxyBin(homeDir);
+  const paths = resolvePaths({ homeDir, profile: opts.profile, claudeSettingsPath: opts.claudeSettingsPath });
 
-  if (!exists(proxyBin)) {
-    fail(`CLIProxyAPI not installed. Run 'install' first.`);
+  if (!exists(paths.proxyBin)) {
+    fail(`CLIProxyAPI not installed for profile '${paths.profile}'. Run 'install --profile ${paths.profile}' first.`);
   }
 
   const flag = provider === "claude" ? "-claude-login" : "-codex-login";
-  log(`Starting ${provider} OAuth login...`);
-  run(proxyBin, ["-config", configFile, flag], { inherit: true });
+  log(`Starting ${provider} OAuth login (profile: ${paths.profile})...`);
+  run(paths.proxyBin, ["-config", paths.configFile, flag], { inherit: true });
   log(`${provider} login completed.`);
 }
 
-async function startFlow() {
+async function startFlow(opts = {}) {
   if (process.platform !== "darwin") fail("macOS only.");
   const homeDir = os.homedir();
   const uid = getUid();
-  const configFile = path.join(homeDir, ".cli-proxy-api", "config.yaml");
-  const port = readPortFromProxyConfig(configFile) ?? DEFAULT_PORT;
-  const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${LABEL_PROXY}.plist`);
+  const paths = resolvePaths({ homeDir, profile: opts.profile, claudeSettingsPath: opts.claudeSettingsPath });
+  const port = readPortFromProxyConfig(paths.configFile) ?? DEFAULT_PORT;
 
-  if (!exists(plistProxy)) fail(`missing plist: ${plistProxy} (run install first)`);
-  launchctlBootstrap(uid, plistProxy);
-  launchctlKickstart(uid, LABEL_PROXY);
+  if (!exists(paths.plistProxy)) fail(`missing plist: ${paths.plistProxy} (run install first)`);
+  launchctlBootstrap(uid, paths.plistProxy);
+  launchctlKickstart(uid, paths.labelProxy);
 
   const healthy = await waitForHealthy(port, 10000);
   if (!healthy) fail("proxy did not become healthy");
-  log("proxy started");
+  log(`proxy started (profile: ${paths.profile})`);
 }
 
-async function stopFlow() {
+async function stopFlow(opts = {}) {
   if (process.platform !== "darwin") fail("macOS only.");
+  const homeDir = os.homedir();
   const uid = getUid();
-  launchctlBootout(uid, LABEL_PROXY);
-  log("proxy stopped");
+  const paths = resolvePaths({ homeDir, profile: opts.profile, claudeSettingsPath: opts.claudeSettingsPath });
+  launchctlBootout(uid, paths.labelProxy);
+  log(`proxy stopped (profile: ${paths.profile})`);
 }
 
-async function statusFlow() {
+async function statusFlow(opts = {}) {
   const homeDir = os.homedir();
-  const proxyDir = path.join(homeDir, ".cli-proxy-api");
-  const configFile = path.join(proxyDir, "config.yaml");
-  const port = readPortFromProxyConfig(configFile) ?? DEFAULT_PORT;
+  const paths = resolvePaths({ homeDir, profile: opts.profile, claudeSettingsPath: opts.claudeSettingsPath });
+  const port = readPortFromProxyConfig(paths.configFile) ?? DEFAULT_PORT;
   const portOk = await proxyHealthcheck(port);
 
+  log(`Profile: ${paths.profile}`);
   log(`Proxy: ${portOk ? "RUNNING" : "NOT RUNNING"} (http://127.0.0.1:${port})`);
 
   if (process.platform === "darwin") {
     const uid = getUid();
-    log(`LaunchAgent: ${launchctlPrint(uid, LABEL_PROXY) ? "loaded" : "not loaded"}`);
+    log(`LaunchAgent: ${launchctlPrint(uid, paths.labelProxy) ? "loaded" : "not loaded"}`);
   }
 
-  if (exists(proxyDir)) {
-    const auth = hasAuthFiles(proxyDir);
-    log(`Claude OAuth: ${auth.hasClaude ? "configured" : "not configured"}`);
-    log(`Codex OAuth: ${auth.hasCodex ? "configured" : "not configured"}`);
-  }
+  const auth = hasAuthFiles(paths.proxyDir);
+  log(`Claude OAuth: ${auth.hasClaude ? "configured" : "not configured"}`);
+  log(`Codex OAuth: ${auth.hasCodex ? "configured" : "not configured"}`);
 
   if (portOk) {
     try {
@@ -607,17 +673,15 @@ async function statusFlow() {
   }
 }
 
-async function uninstallFlow(opts) {
+async function uninstallFlow(opts = {}) {
   if (process.platform !== "darwin") fail("macOS only.");
   const homeDir = os.homedir();
   const username = getUsername();
   const uid = getUid();
-  const plistProxy = path.join(homeDir, "Library", "LaunchAgents", `${LABEL_PROXY}.plist`);
-  const claudeSettingsPath = path.join(homeDir, ".claude", "settings.json");
-  const proxyDir = path.join(homeDir, ".cli-proxy-api");
+  const paths = resolvePaths({ homeDir, profile: opts.profile, claudeSettingsPath: opts.claudeSettingsPath });
 
   // Stop our proxy and clean up legacy labels
-  await stopExistingProxy(uid);
+  await stopExistingProxy(uid, paths.labelProxy);
 
   // Remove legacy plist files
   const legacyPlists = [
@@ -626,20 +690,24 @@ async function uninstallFlow(opts) {
     "com.cliproxyapi",
   ].map((l) => path.join(homeDir, "Library", "LaunchAgents", `${l}.plist`));
 
-  for (const p of [...legacyPlists, plistProxy]) {
+  for (const p of [...legacyPlists, paths.plistProxy]) {
     if (exists(p)) fs.rmSync(p, { force: true });
   }
 
   // Restore Claude Code settings
-  cleanupClaudeSettings({ claudeSettingsPath });
+  if (opts.noGlobalSettings) {
+    log("Skipping Claude Code settings cleanup (--no-global-settings).");
+  } else {
+    cleanupClaudeSettings({ claudeSettingsPath: paths.claudeSettingsPath });
+  }
 
   if (opts.command === "purge") {
-    if (exists(proxyDir)) fs.rmSync(proxyDir, { recursive: true, force: true });
-    log("purge completed (proxy files removed)");
+    if (exists(paths.proxyDir)) fs.rmSync(paths.proxyDir, { recursive: true, force: true });
+    log(`purge completed for profile '${paths.profile}' (proxy files removed)`);
     return;
   }
 
-  log("uninstall completed (proxy files left in place)");
+  log(`uninstall completed for profile '${paths.profile}' (proxy files left in place)`);
 }
 
 async function main() {
@@ -649,22 +717,22 @@ async function main() {
   try {
     switch (opts.command) {
       case "install":
-        await installFlow();
+        await installFlow(opts);
         break;
       case "claude-login":
-        await oauthLoginFlow("claude");
+        await oauthLoginFlow("claude", opts);
         break;
       case "codex-login":
-        await oauthLoginFlow("codex");
+        await oauthLoginFlow("codex", opts);
         break;
       case "start":
-        await startFlow();
+        await startFlow(opts);
         break;
       case "stop":
-        await stopFlow();
+        await stopFlow(opts);
         break;
       case "status":
-        await statusFlow();
+        await statusFlow(opts);
         break;
       case "uninstall":
         await uninstallFlow(opts);

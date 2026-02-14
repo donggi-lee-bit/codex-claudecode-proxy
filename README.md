@@ -68,6 +68,47 @@ npx -y claude-multi-proxy uninstall
 npx -y claude-multi-proxy purge
 ```
 
+## Advanced Usage
+
+### Profile-isolated operation (recommended)
+
+Use one profile per terminal/Claude process to isolate proxy state and settings.
+
+```bash
+# work profile
+npx -y claude-multi-proxy --profile work
+
+# personal profile
+npx -y claude-multi-proxy --profile personal
+```
+
+By default:
+- `default` profile uses `~/.cli-proxy-api` and `~/.claude/settings.json`
+- non-default profile uses `~/.cli-proxy-api-<profile>` and `~/.claude/settings.<profile>.json`
+
+### Custom Claude settings path
+
+```bash
+npx -y claude-multi-proxy --claude-settings-path ~/custom/claude-settings.json
+```
+
+### Skip settings update
+
+```bash
+npx -y claude-multi-proxy --no-global-settings
+```
+
+This skips Claude settings update/cleanup during install/uninstall.
+
+### Profile-aware commands
+
+```bash
+npx -y claude-multi-proxy status --profile work
+npx -y claude-multi-proxy start --profile work
+npx -y claude-multi-proxy stop --profile work
+npx -y claude-multi-proxy uninstall --profile work
+```
+
 ## Requirements
 
 - macOS (LaunchAgent-based)
@@ -101,6 +142,8 @@ Invalid `signature` in `thinking` block
 
 **Workaround:** Use `/clear` before switching models to reset the conversation history.
 
+**Operational recommendation:** Use one profile per terminal/process (e.g., `--profile work`, `--profile personal`) and keep model switching within the same process to a minimum.
+
 ```
 /clear
 /model opus
@@ -111,7 +154,7 @@ See [CLIProxyAPI #1584](https://github.com/router-for-me/CLIProxyAPI/issues/1584
 ## Safety
 
 - Claude Code settings are backed up before any changes
-- `uninstall` restores original Claude Code settings
+- `uninstall` removes proxy-related Claude Code settings keys
 - Proxy binds to `127.0.0.1` only (localhost)
 
 ## License
